@@ -21,3 +21,4 @@ export RUSTFLAGS="-A invalid_reference_casting"
 pip install git+https://github.com/llm-attacks/llm-attacks
 
 huggingface-cli login
+pip install -U transformers
