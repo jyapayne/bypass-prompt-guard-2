@@ -14,10 +14,12 @@ def find_best_word_to_add(
     text: str, 
     benign_class_idx: int, 
     device: torch.device,
-    num_candidates: int = 20
+    num_candidates: int = 20,
+    token_weight: float = 0.5  # Weight for token count prioritization
 ) -> Tuple[Optional[str], float]:
     """
     Evaluate multiple candidate words and find the one that most improves the benign score when added to the prefix.
+    Prioritizes words that result in fewer tokens while still improving the benign score.
     
     Parameters:
     -----------
@@ -28,6 +30,7 @@ def find_best_word_to_add(
     text: The text to append after the prefix
     benign_class_idx: The index of the benign class
     num_candidates: Number of candidate words to test
+    token_weight: Weight for token count prioritization (higher values prioritize shorter prefixes more)
     
     Returns:
     --------
@@ -49,30 +52,20 @@ def find_best_word_to_add(
         print(f"Error testing baseline: {e}")
         return None, 0
     
-    # Generate candidate words to test
-    # Use a mix of different types of words for diversity
-    candidate_pools: List[List[str]] = [
-        random.choices(words, k=num_candidates),
-    ]
-    
-    candidates: List[str] = []
-    for pool in candidate_pools:
-        candidates.extend(pool)
-    
-    # Ensure we have the right number of candidates
-    if len(candidates) > num_candidates:
-        candidates = random.sample(candidates, num_candidates)
-    elif len(candidates) < num_candidates:
-        additional: List[str] = random.choices(words, k=num_candidates - len(candidates))
-        candidates.extend(additional)
+    candidates: List[str] = random.choices(words, k=num_candidates) 
     
     # Test each candidate word
     best_word: Optional[str] = None
     best_score: float = baseline_score
     best_improvement: float = 0
+    best_combined_score: float = 0
     
     insert_positions: List[str] = ["beginning", "middle", "end"]
     results: List[Dict[str, Any]] = []
+    
+    # Store the token count of the original prefix
+    baseline_token_count: int = len(tokenizer.encode(adv_prefix, add_special_tokens=False))
+    max_token_count: int = baseline_token_count * 2  # Assumption: max token count won't exceed double baseline
     
     for word in candidates:
         for position in insert_positions:
@@ -104,18 +97,32 @@ def find_best_word_to_add(
                 improvement: float = benign_score - baseline_score
                 token_count: int = len(tokenizer.encode(test_prefix, add_special_tokens=False))
                 
+                # Calculate token efficiency (lower token count is better)
+                # Normalize token count to 0-1 scale (where 1 is better = fewer tokens)
+                token_efficiency: float = 1.0 - min(1.0, token_count / max_token_count)
+                
+                # Calculate combined score (weighting improvement and token efficiency)
+                # Only consider token efficiency if improvement is positive
+                combined_score: float = 0
+                if improvement > 0:
+                    combined_score = (1 - token_weight) * improvement + token_weight * token_efficiency
+                
                 results.append({
                     "word": word,
                     "position": position,
                     "score": benign_score,
                     "improvement": improvement,
                     "tokens": token_count,
+                    "token_efficiency": token_efficiency,
+                    "combined_score": combined_score,
                     "prefix": test_prefix
                 })
                 
-                print(f"Word '{word}' at {position}: {benign_score:.4f} (Δ: {improvement:.4f}, tokens: {token_count})")
+                print(f"Word '{word}' at {position}: {benign_score:.4f} (Δ: {improvement:.4f}, tokens: {token_count}, combined: {combined_score:.4f})")
                 
-                if benign_score > best_score:
+                # Only consider improvements (benign_score > baseline_score)
+                if improvement > 0 and combined_score > best_combined_score:
+                    best_combined_score = combined_score
                     best_score = benign_score
                     best_word = word
                     best_improvement = improvement
@@ -125,13 +132,13 @@ def find_best_word_to_add(
                 print(f"Error testing word '{word}' at {position}: {e}")
                 continue
     
-    # Sort results by improvement
-    results.sort(key=lambda x: x["improvement"], reverse=True)
+    # Sort results by combined score
+    results.sort(key=lambda x: x["combined_score"], reverse=True)
     
     # Print top 5 results
-    print("\nTop 5 most effective additions:")
+    print("\nTop 5 most effective additions (based on combined score):")
     for i, result in enumerate(results[:5]):
-        print(f"{i+1}. '{result['word']}' at {result['position']}: {result['score']:.4f} (Δ: {result['improvement']:.4f}, tokens: {result['tokens']})")
+        print(f"{i+1}. '{result['word']}' at {result['position']}: {result['score']:.4f} (Δ: {result['improvement']:.4f}, tokens: {result['tokens']}, combined: {result['combined_score']:.4f})")
     
     if best_word:
         print(f"\nBest word to add: '{best_word}' at {best_position}")
@@ -226,9 +233,11 @@ def analyze_token_contributions(
     min_benign_confidence: float, 
     device: torch.device,
     min_acceptable_benign: float = 0.6,
+    token_length_weight: float = 0.3,  # Weight for prioritizing removal of short tokens
 ) -> str:
     """
     Analyze which tokens contribute most to the benign rating and systematically remove the least important ones.
+    Prioritizes removing shorter tokens when they have similar impacts on benign score.
     
     This performs an ablation study on the tokens in the prefix and iteratively removes tokens
     that contribute the least to maintaining the benign classification.
@@ -278,9 +287,8 @@ def analyze_token_contributions(
         print(f"Current tokens: {tokenizer.convert_ids_to_tokens(current_token_ids)}")
         print(f"Current benign score: {current_benign_score:.4f}")
         
-        best_removal_idx: Optional[int] = None
-        best_removal_score: float = -1
-        best_removal_prefix: Optional[str] = None
+        # Track removal candidates with their scores and token lengths
+        removal_candidates: List[Dict[str, Any]] = []
         
         # Test removing each token
         for i in range(len(current_token_ids)):
@@ -288,6 +296,7 @@ def analyze_token_contributions(
             test_token_ids: List[int] = current_token_ids.copy()
             removed_token_id: int = test_token_ids.pop(i)
             removed_token: str = tokenizer.convert_ids_to_tokens([removed_token_id])[0]
+            removed_token_length: int = len(removed_token)
             
             # Skip if empty
             if not test_token_ids:
@@ -307,31 +316,49 @@ def analyze_token_contributions(
                     probs: torch.Tensor = torch.softmax(logits, dim=-1)
                     benign_score: float = probs[0][benign_class_idx].item()
                 
-                print(f"  Removing token {i} '{removed_token}': benign_score={benign_score:.4f}")
+                # Calculate a score that considers both benign classification and token length
+                # Higher score = more desirable to remove (good benign score + short token)
+                # Normalize token length (1-10 scale): shorter tokens get higher scores
+                normalized_length_score: float = max(0, min(1, 1 - (removed_token_length / 10)))
                 
-                # Is this the best removal so far?
-                if benign_score >= min_acceptable_benign and benign_score > best_removal_score:
-                    best_removal_idx = i
-                    best_removal_score = benign_score
-                    best_removal_prefix = test_prefix
+                # Only consider tokens that maintain acceptable benign score
+                if benign_score >= min_acceptable_benign:
+                    combined_score: float = (1 - token_length_weight) * benign_score + token_length_weight * normalized_length_score
+                    
+                    removal_candidates.append({
+                        "index": i,
+                        "token": removed_token,
+                        "length": removed_token_length,
+                        "benign_score": benign_score,
+                        "length_score": normalized_length_score,
+                        "combined_score": combined_score,
+                        "prefix": test_prefix
+                    })
+                    
+                    print(f"  Removing token {i} '{removed_token}' (len={removed_token_length}): benign={benign_score:.4f}, combined={combined_score:.4f}")
             except Exception as e:
                 print(f"  Error testing removal of token {i}: {e}")
                 continue
         
-        # If we found a token to remove that keeps acceptable classification
-        if best_removal_idx is not None:
-            removed_token_id: int = current_token_ids.pop(best_removal_idx)
-            removed_token: str = tokenizer.convert_ids_to_tokens([removed_token_id])[0]
-            current_prefix = best_removal_prefix
-            current_benign_score = best_removal_score
+        # If we found any viable candidates
+        if removal_candidates:
+            # Sort by combined score (highest first)
+            removal_candidates.sort(key=lambda x: x["combined_score"], reverse=True)
             
-            print(f"SUCCESS! Removed token {best_removal_idx} '{removed_token}', new benign score: {current_benign_score:.4f}")
+            # Take the best candidate
+            best_candidate = removal_candidates[0]
+            best_removal_idx = best_candidate["index"]
+            removed_token_id = current_token_ids.pop(best_removal_idx)
+            removed_token = best_candidate["token"]
+            current_prefix = best_candidate["prefix"]
+            current_benign_score = best_candidate["benign_score"]
+            
+            print(f"SUCCESS! Removed token {best_removal_idx} '{removed_token}' (len={best_candidate['length']}), new benign score: {current_benign_score:.4f}")
             print(f"New prefix: '{current_prefix}'")
             print(f"New token count: {len(current_token_ids)}")
             
             # Update best prefix if it's better than our current best
-            if best_removal_score >= min_acceptable_benign:
-                best_prefix = current_prefix
+            best_prefix = current_prefix
         else:
             # If we can't remove any more tokens without dropping below threshold
             print("Cannot remove any more tokens while maintaining acceptable benign score.")
@@ -340,6 +367,9 @@ def analyze_token_contributions(
     # Try a few final options if we ended up with a very short prefix
     if len(current_token_ids) <= 3:
         print("\n----- TESTING ADDITIONAL MINIMAL OPTIONS -----")
+        
+        # Priority is short tokens with good benign scores
+        final_candidates = []
         
         for test_prefix in ["A", "The", "Safe", "Benign", "Educational", "Academic", ".", " ", "✓"]:
             try:
@@ -353,15 +383,28 @@ def analyze_token_contributions(
                 test_token_count: int = len(tokenizer.encode(test_prefix, add_special_tokens=False))
                 print(f"Option '{test_prefix}': tokens={test_token_count}, benign_score={benign_score:.4f}")
                 
-                # Is this a better option?
-                if benign_score >= min_acceptable_benign and test_token_count < len(current_token_ids):
-                    best_prefix = test_prefix
-                    current_prefix = test_prefix
-                    current_benign_score = benign_score
-                    current_token_ids = tokenizer.encode(test_prefix, add_special_tokens=False)
-                    print(f"SUCCESS! Found better minimal prefix: '{test_prefix}' with {test_token_count} tokens")
+                # Is this a viable option?
+                if benign_score >= min_acceptable_benign:
+                    final_candidates.append({
+                        "prefix": test_prefix,
+                        "tokens": test_token_count,
+                        "benign_score": benign_score
+                    })
             except Exception as e:
                 continue
+        
+        # Find the best final candidate (fewest tokens with acceptable benign score)
+        if final_candidates:
+            # Sort by token count (ascending) then by benign score (descending) for tiebreakers
+            final_candidates.sort(key=lambda x: (x["tokens"], -x["benign_score"]))
+            best_final = final_candidates[0]
+            
+            if best_final["tokens"] < len(current_token_ids):
+                best_prefix = best_final["prefix"]
+                current_prefix = best_final["prefix"]
+                current_benign_score = best_final["benign_score"]
+                current_token_ids = tokenizer.encode(best_final["prefix"], add_special_tokens=False)
+                print(f"SUCCESS! Found better minimal prefix: '{best_final['prefix']}' with {best_final['tokens']} tokens")
     
     # Report results
     final_token_count: int = len(tokenizer.encode(best_prefix, add_special_tokens=False))
@@ -388,11 +431,17 @@ def minimize_tokens(
     min_benign_confidence: float, 
     device: torch.device,
     target_tokens: int = 1, 
-    min_acceptable_benign: float = 0.6
+    min_acceptable_benign: float = 0.6,
+    token_length_weight: float = 0.3  # Weight for prioritizing removal of short tokens
 ) -> str:
     """
     Minimize tokens using only token contribution analysis (ablation study).
     This approach systematically removes tokens that contribute least to the benign classification.
+    Prioritizes removing shorter tokens when they have similar impacts on benign score.
+    
+    Parameters:
+    -----------
+    token_length_weight: Weight for prioritizing removal of short tokens (0-1, higher = prioritize short tokens more)
     """
     print("\n===== STARTING TOKEN MINIMIZATION =====")
     
@@ -400,7 +449,8 @@ def minimize_tokens(
     ablation_prefix: str = analyze_token_contributions(
         model, tokenizer, injection_text, adv_prefix, text, 
         benign_class_idx, min_benign_confidence=min_benign_confidence,
-        device=device, min_acceptable_benign=min_acceptable_benign
+        device=device, min_acceptable_benign=min_acceptable_benign,
+        token_length_weight=token_length_weight  # Pass through the token length weight
     )
     
     # Report final token count
