@@ -19,8 +19,6 @@ device: torch.device = torch.device("cuda" if cuda_available else "cpu")
 # use token from environment variable
 login(token=os.getenv("HF_TOKEN"))
 
-bible_words: List[str] = open("bible.txt").read().split()
-
 alpha: float = 0.3 # weight between benign maximization and loss minimization
 min_benign_confidence: float = 0.95  # Minimum benign probability to stop (95%)
 words_to_inject: int = 1

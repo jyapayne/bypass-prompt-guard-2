@@ -150,6 +150,8 @@ def find_best_word_to_add(
     results = []
     best_combined_score = 0
     best_result_idx = -1
+
+    print(f"Running score analysis for {len(all_candidate_prefixes)} candidate prefixes")
     
     for idx, candidate in enumerate(all_candidate_prefixes):
         benign_score = benign_scores[idx]
@@ -187,7 +189,7 @@ def find_best_word_to_add(
                 token_count, combined_score
             )
         
-        print(f"Word '{candidate['word']}' at {candidate['position']}: {benign_score:.4f} (Δ: {improvement:.4f}, tokens: {token_count}, combined: {combined_score:.4f})")
+        #print(f"Word '{candidate['word']}' at {candidate['position']}: {benign_score:.4f} (Δ: {improvement:.4f}, tokens: {token_count}, combined: {combined_score:.4f})")
         
         # Only consider improvements (benign_score > baseline_score)
         if improvement > 0 and combined_score > best_combined_score:
@@ -297,10 +299,8 @@ def analyze_token_contributions(
     adv_prefix: str, 
     text: str, 
     benign_class_idx: int, 
-    min_benign_confidence: float, 
     device: torch.device,
     min_acceptable_benign: float = 0.6,
-    token_length_weight: float = 0.3,  # Weight for prioritizing removal of short tokens
     order_template: str = "{injection}{prefix}{text}"  # Template for ordering components
 ) -> str:
     """
@@ -412,7 +412,6 @@ def minimize_tokens(
     benign_class_idx: int, 
     min_benign_confidence: float, 
     device: torch.device,
-    target_tokens: int = 1, 
     min_acceptable_benign: float = 0.6,
     token_length_weight: float = 0.3  # Weight for prioritizing removal of short tokens
 ) -> str:
@@ -543,7 +542,6 @@ def get_combined_score(
     text: str, 
     candidates: List[str], 
     benign_idx: int, 
-    malicious_idx: int, 
     device: torch.device,
     alpha: float = 0.5, 
     token_penalty_weight: float = 0.1,
