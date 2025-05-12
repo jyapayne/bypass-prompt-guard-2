@@ -410,10 +410,8 @@ def minimize_tokens(
     adv_prefix: str, 
     text: str, 
     benign_class_idx: int, 
-    min_benign_confidence: float, 
     device: torch.device,
     min_acceptable_benign: float = 0.6,
-    token_length_weight: float = 0.3  # Weight for prioritizing removal of short tokens
 ) -> str:
     """
     Minimize tokens using only token contribution analysis (ablation study).
@@ -429,9 +427,8 @@ def minimize_tokens(
     # Use only token ablation approach - systematically remove tokens that contribute least
     ablation_prefix: str = analyze_token_contributions(
         model, tokenizer, injection_text, adv_prefix, text, 
-        benign_class_idx, min_benign_confidence=min_benign_confidence,
+        benign_class_idx,
         device=device, min_acceptable_benign=min_acceptable_benign,
-        token_length_weight=token_length_weight  # Pass through the token length weight
     )
     
     # Report final token count

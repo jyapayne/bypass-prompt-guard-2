@@ -330,8 +330,8 @@ def main():
         if best_prefix is not None:
             best_prefix = minimize_tokens(
                 model, tokenizer, injection_text, best_prefix, text, 
-                benign_class_idx, min_benign_confidence, device=device, 
-                target_tokens=1, min_acceptable_benign=min_acceptable_benign,
+                benign_class_idx, device=device, 
+                min_acceptable_benign=min_acceptable_benign,
             )
     else:
         print("\n===== Did not find a high confidence benign classification =====")
@@ -341,8 +341,8 @@ def main():
             # Still try to minimize tokens
             best_prefix = minimize_tokens(
                 model, tokenizer, injection_text, best_prefix, text, 
-                benign_class_idx, best_score * 0.95, target_tokens=1, 
-                min_acceptable_benign=min_acceptable_benign, device=device,
+                benign_class_idx, device=device, 
+                min_acceptable_benign=min_acceptable_benign,
             )
 
     # Use the best prefix found across all runs
