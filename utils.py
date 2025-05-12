@@ -4,7 +4,11 @@ from typing import Dict, List, Optional, Tuple, Any
 import tiktoken
 import random
 import torch.nn as nn
-from words import words
+from words import words4 as words
+from wordsdb import WordsDatabase
+
+# Create a global instance of the database
+words_db = WordsDatabase()
 
 def find_best_word_to_add(
     model: AutoModelForSequenceClassification, 
@@ -15,7 +19,10 @@ def find_best_word_to_add(
     benign_class_idx: int, 
     device: torch.device,
     num_candidates: int = 20,
-    token_weight: float = 0.5  # Weight for token count prioritization
+    token_weight: float = 0.5,  # Weight for token count prioritization
+    use_db: bool = True,  # Whether to use the database for word selection and tracking
+    token_priority: float = 0.3,  # How much to prioritize words with fewer tokens when selecting from database
+    order_template: str = "{injection}{prefix}{text}"  # Template for ordering components
 ) -> Tuple[Optional[str], float]:
     """
     Evaluate multiple candidate words and find the one that most improves the benign score when added to the prefix.
@@ -31,17 +38,21 @@ def find_best_word_to_add(
     benign_class_idx: The index of the benign class
     num_candidates: Number of candidate words to test
     token_weight: Weight for token count prioritization (higher values prioritize shorter prefixes more)
+    use_db: Whether to use the database for word selection and tracking
+    token_priority: How much to prioritize words with fewer tokens when selecting from database
+    order_template: Template string for ordering components (using {injection}, {prefix}, {text})
     
     Returns:
     --------
     best_word: The word that most improves the benign score
     improvement: The amount of improvement in benign score
     """
-    print(f"\n----- TESTING {num_candidates} CANDIDATE WORDS TO ADD -----")
+    print(f"\n----- TESTING {num_candidates} CANDIDATE WORDS TO ADD (BATCHED) -----")
     
     # Get baseline benign score with current prefix
     try:
-        inputs: Dict[str, torch.Tensor] = tokenizer(injection_text + adv_prefix + text, return_tensors="pt")
+        full_text = order_template.format(injection=injection_text, prefix=adv_prefix, text=text)
+        inputs: Dict[str, torch.Tensor] = tokenizer(full_text, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
             logits: torch.Tensor = model(**inputs).logits
@@ -52,21 +63,37 @@ def find_best_word_to_add(
         print(f"Error testing baseline: {e}")
         return None, 0
     
-    candidates: List[str] = random.choices(words, k=num_candidates) 
+    # Generate candidate words to test - prioritize known good words if using database
+    if use_db:
+        # Try to get high-performing words from the database, with token count consideration
+        db_candidates_count = num_candidates // 2
+        if db_candidates_count > 0:
+            top_words = words_db.get_top_words(
+                limit=db_candidates_count, 
+                min_uses=1,  # Only need to have been tested once
+                sort_by="combined" if token_priority > 0 else "improvement",
+                token_weight=token_priority
+            )
+            
+            # If we got some words from the database, use them plus some random words
+            if top_words:
+                print(f"Using {len(top_words)} words from database (with token priority {token_priority}) plus {num_candidates - len(top_words)} random words")
+                remaining = num_candidates - len(top_words)
+                candidates = top_words + random.choices(words, k=remaining)
+            else:
+                # Otherwise just use random words
+                candidates = random.choices(words, k=num_candidates)
+        else:
+            candidates = random.choices(words, k=num_candidates)
+    else:
+        # Just use random words if not using the database
+        candidates = random.choices(words, k=num_candidates)
     
-    # Test each candidate word
-    best_word: Optional[str] = None
-    best_score: float = baseline_score
-    best_improvement: float = 0
-    best_combined_score: float = 0
-    
+    # Define positions to test for each word
     insert_positions: List[str] = ["beginning", "middle", "end"]
-    results: List[Dict[str, Any]] = []
     
-    # Store the token count of the original prefix
-    baseline_token_count: int = len(tokenizer.encode(adv_prefix, add_special_tokens=False))
-    max_token_count: int = baseline_token_count * 2  # Assumption: max token count won't exceed double baseline
-    
+    # Generate all candidate prefixes - one for each word + position combination
+    all_candidate_prefixes = []
     for word in candidates:
         for position in insert_positions:
             # Create test prefix with the candidate word
@@ -86,51 +113,86 @@ def find_best_word_to_add(
                     middle_idx: int = len(adv_prefix) // 2
                     test_prefix = adv_prefix[:middle_idx] + " " + word + " " + adv_prefix[middle_idx:]
             
-            try:
-                inputs: Dict[str, torch.Tensor] = tokenizer(injection_text + test_prefix + text, return_tensors="pt")
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-                with torch.no_grad():
-                    logits: torch.Tensor = model(**inputs).logits
-                    probs: torch.Tensor = torch.softmax(logits, dim=-1)
-                    benign_score: float = probs[0][benign_class_idx].item()
-                
-                improvement: float = benign_score - baseline_score
-                token_count: int = len(tokenizer.encode(test_prefix, add_special_tokens=False))
-                
-                # Calculate token efficiency (lower token count is better)
-                # Normalize token count to 0-1 scale (where 1 is better = fewer tokens)
-                token_efficiency: float = 1.0 - min(1.0, token_count / max_token_count)
-                
-                # Calculate combined score (weighting improvement and token efficiency)
-                # Only consider token efficiency if improvement is positive
-                combined_score: float = 0
-                if improvement > 0:
-                    combined_score = (1 - token_weight) * improvement + token_weight * token_efficiency
-                
-                results.append({
-                    "word": word,
-                    "position": position,
-                    "score": benign_score,
-                    "improvement": improvement,
-                    "tokens": token_count,
-                    "token_efficiency": token_efficiency,
-                    "combined_score": combined_score,
-                    "prefix": test_prefix
-                })
-                
-                print(f"Word '{word}' at {position}: {benign_score:.4f} (Δ: {improvement:.4f}, tokens: {token_count}, combined: {combined_score:.4f})")
-                
-                # Only consider improvements (benign_score > baseline_score)
-                if improvement > 0 and combined_score > best_combined_score:
-                    best_combined_score = combined_score
-                    best_score = benign_score
-                    best_word = word
-                    best_improvement = improvement
-                    best_position: str = position
-                    best_prefix: str = test_prefix
-            except Exception as e:
-                print(f"Error testing word '{word}' at {position}: {e}")
-                continue
+            all_candidate_prefixes.append({
+                "prefix": test_prefix,
+                "word": word,
+                "position": position,
+                "token_count": len(tokenizer.encode(test_prefix, add_special_tokens=False))
+            })
+    
+    # Prepare all candidate full texts for batch evaluation
+    candidate_full_texts = [
+        order_template.format(injection=injection_text, prefix=c["prefix"], text=text) 
+        for c in all_candidate_prefixes
+    ]
+    
+    if not candidate_full_texts:
+        print("No candidate prefixes to evaluate")
+        return None, 0
+        
+    # Batch inference
+    try:
+        inputs = tokenizer(candidate_full_texts, return_tensors="pt", padding=True, truncation=True)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            logits = model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1)
+            benign_scores = probs[:, benign_class_idx].cpu().numpy()
+    except Exception as e:
+        print(f"Error in batch evaluation: {e}")
+        return None, 0
+    
+    # Calculate token counts for normalization
+    token_counts = [c["token_count"] for c in all_candidate_prefixes]
+    max_token_count = max(token_counts) if token_counts else 1
+    
+    # Process the results
+    results = []
+    best_combined_score = 0
+    best_result_idx = -1
+    
+    for idx, candidate in enumerate(all_candidate_prefixes):
+        benign_score = benign_scores[idx]
+        improvement = benign_score - baseline_score
+        token_count = candidate["token_count"]
+        
+        # Calculate token efficiency (lower token count is better)
+        # Normalize token count to 0-1 scale (where 1 is better = fewer tokens)
+        token_efficiency = 1.0 - min(1.0, token_count / max_token_count)
+        
+        # Calculate combined score (weighting improvement and token efficiency)
+        # Only consider token efficiency if improvement is positive
+        combined_score = 0
+        if improvement > 0:
+            combined_score = (1 - token_weight) * improvement + token_weight * token_efficiency
+        
+        # Record performance in results list
+        result = {
+            "word": candidate["word"],
+            "position": candidate["position"],
+            "score": benign_score,
+            "improvement": improvement,
+            "tokens": token_count,
+            "token_efficiency": token_efficiency,
+            "combined_score": combined_score,
+            "prefix": candidate["prefix"]
+        }
+        
+        results.append(result)
+        
+        # Record the performance in the database if enabled
+        if use_db and improvement != 0:  # Only record non-zero improvements
+            words_db.record_word_performance(
+                candidate["word"], candidate["position"], benign_score, improvement, 
+                token_count, combined_score
+            )
+        
+        print(f"Word '{candidate['word']}' at {candidate['position']}: {benign_score:.4f} (Δ: {improvement:.4f}, tokens: {token_count}, combined: {combined_score:.4f})")
+        
+        # Only consider improvements (benign_score > baseline_score)
+        if improvement > 0 and combined_score > best_combined_score:
+            best_combined_score = combined_score
+            best_result_idx = idx
     
     # Sort results by combined score
     results.sort(key=lambda x: x["combined_score"], reverse=True)
@@ -140,15 +202,20 @@ def find_best_word_to_add(
     for i, result in enumerate(results[:5]):
         print(f"{i+1}. '{result['word']}' at {result['position']}: {result['score']:.4f} (Δ: {result['improvement']:.4f}, tokens: {result['tokens']}, combined: {result['combined_score']:.4f})")
     
-    if best_word:
+    if best_result_idx >= 0:
+        best_result = all_candidate_prefixes[best_result_idx]
+        best_word = best_result["word"]
+        best_position = best_result["position"]
+        best_improvement = benign_scores[best_result_idx] - baseline_score
+        best_prefix = best_result["prefix"]
+        
         print(f"\nBest word to add: '{best_word}' at {best_position}")
-        print(f"Improvement: {best_improvement:.4f} (from {baseline_score:.4f} to {best_score:.4f})")
-        print(f"New prefix: {best_prefix}")
+        print(f"Improvement: {best_improvement:.4f} (from {baseline_score:.4f} to {benign_scores[best_result_idx]:.4f})")
+        print(f"New prefix: '{best_prefix}'")
         return best_prefix, best_improvement
     else:
         print("No improvement found from any candidate word")
         return None, 0
-
 
 def token_gradients_combined(
     model: AutoModelForSequenceClassification, 
@@ -234,192 +301,107 @@ def analyze_token_contributions(
     device: torch.device,
     min_acceptable_benign: float = 0.6,
     token_length_weight: float = 0.3,  # Weight for prioritizing removal of short tokens
+    order_template: str = "{injection}{prefix}{text}"  # Template for ordering components
 ) -> str:
     """
-    Analyze which tokens contribute most to the benign rating and systematically remove the least important ones.
-    Prioritizes removing shorter tokens when they have similar impacts on benign score.
-    
-    This performs an ablation study on the tokens in the prefix and iteratively removes tokens
-    that contribute the least to maintaining the benign classification.
+    Simple, non-batched approach to remove as many tokens as possible while keeping
+    the benign score above the minimum acceptable threshold.
     """
-    print("\n===== STARTING TOKEN CONTRIBUTION ANALYSIS =====")
+    print("\n----- ANALYZING TOKEN CONTRIBUTIONS (NO BATCHING) -----")
     
-    # Check original prefix
-    prefix_token_ids: torch.Tensor = tokenizer.encode(adv_prefix, add_special_tokens=False)
-    original_token_count: int = len(prefix_token_ids)
-    prefix_tokens: List[str] = tokenizer.convert_ids_to_tokens(prefix_token_ids)
+    # Get baseline benign score
+    full_text = order_template.format(injection=injection_text, prefix=adv_prefix, text=text)
+    inputs = tokenizer(full_text, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     
+    with torch.no_grad():
+        logits = model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1)
+        baseline_score = probs[0][benign_class_idx].item()
+        
     print(f"Original prefix: '{adv_prefix}'")
-    print(f"Original token count: {original_token_count}")
-    print(f"Token breakdown: {prefix_tokens}")
+    print(f"Original benign score: {baseline_score:.4f}")
     
-    # Get original benign score
-    try:
-        inputs: Dict[str, torch.Tensor] = tokenizer(injection_text + adv_prefix + text, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            logits: torch.Tensor = model(**inputs).logits
-            probs: torch.Tensor = torch.softmax(logits, dim=-1)
-            original_benign_score: float = probs[0][benign_class_idx].item()
-        print(f"Original benign score: {original_benign_score:.4f}")
-    except Exception as e:
-        print(f"Error testing original prefix: {e}")
+    # Use exactly the min_acceptable_benign as threshold
+    threshold = min_acceptable_benign
+    print(f"Using threshold: {threshold:.4f}")
+    
+    if baseline_score < threshold:
+        print(f"Baseline score {baseline_score:.4f} already below threshold {threshold:.4f}. Stopping.")
         return adv_prefix
     
-    # If we don't meet the minimum threshold, adjust it
-    if original_benign_score < min_acceptable_benign:
-        min_acceptable_benign = original_benign_score * 0.95
-        print(f"Adjusted minimum acceptable threshold to {min_acceptable_benign:.4f}")
+    current_prefix = adv_prefix
+    remaining_tokens = tokenizer.tokenize(current_prefix)
+    print(f"Starting with {len(remaining_tokens)} tokens")
     
-    best_prefix: str = adv_prefix
-    current_prefix: str = adv_prefix
-    current_token_ids: List[int] = prefix_token_ids.copy()
-    current_benign_score: float = original_benign_score
+    removed_tokens = []
     
-    print("\n----- ITERATIVE TOKEN ABLATION -----")
-    
-    # Keep removing tokens until we can't remove any more
-    iteration: int = 0
-    while len(current_token_ids) > 1:
-        iteration += 1
-        print(f"\nIteration {iteration}: Testing removal of individual tokens")
-        print(f"Current token count: {len(current_token_ids)}")
-        print(f"Current tokens: {tokenizer.convert_ids_to_tokens(current_token_ids)}")
-        print(f"Current benign score: {current_benign_score:.4f}")
+    while len(remaining_tokens) > 1:
+        # Try removing each token
+        best_candidate = None
+        best_score = -float('inf')
+        best_idx = -1
         
-        # Track removal candidates with their scores and token lengths
-        removal_candidates: List[Dict[str, Any]] = []
-        
-        # Test removing each token
-        for i in range(len(current_token_ids)):
-            # Create a version without this token
-            test_token_ids: List[int] = current_token_ids.copy()
-            removed_token_id: int = test_token_ids.pop(i)
-            removed_token: str = tokenizer.convert_ids_to_tokens([removed_token_id])[0]
-            removed_token_length: int = len(removed_token)
+        for i in range(len(remaining_tokens)):
+            # Create a new candidate with this token removed
+            tokens_without_i = remaining_tokens.copy()
+            token_to_remove = tokens_without_i.pop(i)
+            candidate_prefix = tokenizer.convert_tokens_to_string(tokens_without_i)
             
-            # Skip if empty
-            if not test_token_ids:
-                continue
-                
-            test_prefix: str = tokenizer.decode(test_token_ids)
-            
-            # Skip if empty after decoding
-            if not test_prefix.strip() and current_benign_score >= min_acceptable_benign:
-                continue
+            # Evaluate this candidate
+            full_text = order_template.format(injection=injection_text, prefix=candidate_prefix, text=text)
             
             try:
-                inputs: Dict[str, torch.Tensor] = tokenizer(injection_text + test_prefix + text, return_tensors="pt")
+                inputs = tokenizer(full_text, return_tensors="pt")
                 inputs = {k: v.to(device) for k, v in inputs.items()}
+                
                 with torch.no_grad():
-                    logits: torch.Tensor = model(**inputs).logits
-                    probs: torch.Tensor = torch.softmax(logits, dim=-1)
-                    benign_score: float = probs[0][benign_class_idx].item()
+                    logits = model(**inputs).logits
+                    probs = torch.softmax(logits, dim=-1)
+                    score = probs[0][benign_class_idx].item()
                 
-                # Calculate a score that considers both benign classification and token length
-                # Higher score = more desirable to remove (good benign score + short token)
-                # Normalize token length (1-10 scale): shorter tokens get higher scores
-                normalized_length_score: float = max(0, min(1, 1 - (removed_token_length / 10)))
+                print(f"  Without token {i} ('{token_to_remove}'): score = {score:.4f}")
                 
-                # Only consider tokens that maintain acceptable benign score
-                if benign_score >= min_acceptable_benign:
-                    combined_score: float = (1 - token_length_weight) * benign_score + token_length_weight * normalized_length_score
-                    
-                    removal_candidates.append({
-                        "index": i,
-                        "token": removed_token,
-                        "length": removed_token_length,
-                        "benign_score": benign_score,
-                        "length_score": normalized_length_score,
-                        "combined_score": combined_score,
-                        "prefix": test_prefix
-                    })
-                    
-                    print(f"  Removing token {i} '{removed_token}' (len={removed_token_length}): benign={benign_score:.4f}, combined={combined_score:.4f}")
+                # If this is still above threshold and better than our current best
+                if score >= threshold and score > best_score:
+                    best_candidate = candidate_prefix
+                    best_score = score
+                    best_idx = i
+                    best_token = token_to_remove
             except Exception as e:
-                print(f"  Error testing removal of token {i}: {e}")
-                continue
+                print(f"  Error evaluating without token {i}: {e}")
         
-        # If we found any viable candidates
-        if removal_candidates:
-            # Sort by combined score (highest first)
-            removal_candidates.sort(key=lambda x: x["combined_score"], reverse=True)
-            
-            # Take the best candidate
-            best_candidate = removal_candidates[0]
-            best_removal_idx = best_candidate["index"]
-            removed_token_id = current_token_ids.pop(best_removal_idx)
-            removed_token = best_candidate["token"]
-            current_prefix = best_candidate["prefix"]
-            current_benign_score = best_candidate["benign_score"]
-            
-            print(f"SUCCESS! Removed token {best_removal_idx} '{removed_token}' (len={best_candidate['length']}), new benign score: {current_benign_score:.4f}")
-            print(f"New prefix: '{current_prefix}'")
-            print(f"New token count: {len(current_token_ids)}")
-            
-            # Update best prefix if it's better than our current best
-            best_prefix = current_prefix
+        # If we found a valid candidate, update our prefix
+        if best_candidate:
+            current_prefix = best_candidate
+            removed_token = remaining_tokens.pop(best_idx)
+            removed_tokens.append(removed_token)
+            print(f"✓ Removed token {best_idx} ('{best_token}'): new score = {best_score:.4f}, tokens left: {len(remaining_tokens)}")
         else:
-            # If we can't remove any more tokens without dropping below threshold
-            print("Cannot remove any more tokens while maintaining acceptable benign score.")
+            print(f"Cannot remove any more tokens while staying above threshold {threshold:.4f}")
             break
     
-    # Try a few final options if we ended up with a very short prefix
-    if len(current_token_ids) <= 3:
-        print("\n----- TESTING ADDITIONAL MINIMAL OPTIONS -----")
-        
-        # Priority is short tokens with good benign scores
-        final_candidates = []
-        
-        for test_prefix in ["A", "The", "Safe", "Benign", "Educational", "Academic", ".", " ", "✓"]:
-            try:
-                inputs: Dict[str, torch.Tensor] = tokenizer(injection_text + test_prefix + text, return_tensors="pt")
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-                with torch.no_grad():
-                    logits: torch.Tensor = model(**inputs).logits
-                    probs: torch.Tensor = torch.softmax(logits, dim=-1)
-                    benign_score: float = probs[0][benign_class_idx].item()
-                
-                test_token_count: int = len(tokenizer.encode(test_prefix, add_special_tokens=False))
-                print(f"Option '{test_prefix}': tokens={test_token_count}, benign_score={benign_score:.4f}")
-                
-                # Is this a viable option?
-                if benign_score >= min_acceptable_benign:
-                    final_candidates.append({
-                        "prefix": test_prefix,
-                        "tokens": test_token_count,
-                        "benign_score": benign_score
-                    })
-            except Exception as e:
-                continue
-        
-        # Find the best final candidate (fewest tokens with acceptable benign score)
-        if final_candidates:
-            # Sort by token count (ascending) then by benign score (descending) for tiebreakers
-            final_candidates.sort(key=lambda x: (x["tokens"], -x["benign_score"]))
-            best_final = final_candidates[0]
-            
-            if best_final["tokens"] < len(current_token_ids):
-                best_prefix = best_final["prefix"]
-                current_prefix = best_final["prefix"]
-                current_benign_score = best_final["benign_score"]
-                current_token_ids = tokenizer.encode(best_final["prefix"], add_special_tokens=False)
-                print(f"SUCCESS! Found better minimal prefix: '{best_final['prefix']}' with {best_final['tokens']} tokens")
-    
-    # Report results
-    final_token_count: int = len(tokenizer.encode(best_prefix, add_special_tokens=False))
-    reduction: float = ((original_token_count - final_token_count) / original_token_count * 100) if original_token_count > 0 else 0
-    
-    print("\n===== TOKEN ABLATION COMPLETE =====")
+    # Final results
+    print("\n===== TOKEN REMOVAL COMPLETE =====")
     print(f"Original prefix: '{adv_prefix}'")
-    print(f"Original token count: {original_token_count}")
-    print(f"Original benign score: {original_benign_score:.4f}")
-    print(f"Final prefix: '{best_prefix}'")
-    print(f"Final token count: {final_token_count}")
-    print(f"Final benign score: {current_benign_score:.4f}")
-    print(f"Reduction: {reduction:.2f}%")
+    print(f"Final prefix: '{current_prefix}'")
+    print(f"Removed {len(removed_tokens)} tokens: {removed_tokens}")
+    print(f"Original token count: {len(tokenizer.tokenize(adv_prefix))}")
+    print(f"Final token count: {len(remaining_tokens)}")
     
-    return best_prefix
+    # Final verification
+    full_text = order_template.format(injection=injection_text, prefix=current_prefix, text=text)
+    inputs = tokenizer(full_text, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    with torch.no_grad():
+        logits = model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1)
+        final_score = probs[0][benign_class_idx].item()
+    
+    print(f"Final benign score: {final_score:.4f}")
+    
+    return current_prefix
 
 def minimize_tokens(
     model: AutoModelForSequenceClassification, 
@@ -507,10 +489,44 @@ def sample_control(
 
     return new_control_toks
 
-def get_random_words(n: int = 10) -> List[str]:
-    # pick n random words
-    return random.choices(words, k=n)
-    #return random.choices(bible_words, k=n)
+def get_random_words(n: int = 10, min_uses: int = 0, token_priority: float = 0.3) -> List[str]:
+    """
+    Get a list of words to use, prioritizing words that have performed well in the past.
+    
+    Parameters:
+    -----------
+    n: Number of words to return
+    min_uses: Minimum number of uses a word must have to be considered from the database
+    token_priority: How much to prioritize words with fewer tokens (0-1)
+                   0 = purely improvement based, 1 = purely token count based
+    
+    Returns:
+    --------
+    List of words
+    """
+    # Try to get high-performing words from the database
+    if token_priority <= 0:
+        # Sort purely by improvement
+        top_words = words_db.get_top_words(limit=n, min_uses=min_uses, sort_by="improvement")
+    elif token_priority >= 1:
+        # Sort purely by token count (ascending)
+        top_words = words_db.get_top_words(limit=n, min_uses=min_uses, sort_by="tokens")
+    else:
+        # Use combined sorting with the specified token weight
+        top_words = words_db.get_top_words(
+            limit=n, 
+            min_uses=min_uses, 
+            sort_by="combined", 
+            token_weight=token_priority
+        )
+    
+    # If we got enough words from the database, use them
+    if len(top_words) >= n:
+        return top_words[:n]
+    
+    # Otherwise, use what we got plus some random words
+    remaining = n - len(top_words)
+    return top_words + random.choices(words, k=remaining)
 
 def count_tokens(text: str, model: str = "gpt-3.5") -> int:
     """Count the number of tokens in a text string using tiktoken."""
