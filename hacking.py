@@ -8,17 +8,16 @@ import argparse
 from typing import List, Dict, Tuple, Any, Optional
 from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 from huggingface_hub import login
-from llm_attacks.minimal_gcg.opt_utils import get_filtered_cands
 from words import words
 from utils import (
     minimize_tokens,
     sample_control,
     count_tokens,
-    get_combined_score,
     get_random_words,
     token_gradients_combined,
     find_best_word_to_add,
     words_db,
+    get_filtered_cands,
 )
 
 # check if cuda is available
