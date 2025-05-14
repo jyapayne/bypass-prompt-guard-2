@@ -1,4 +1,28 @@
 words4 = [
+    "animalética",  # Likely Spanish/Portuguese "animalética" (animal ethics)
+    "Description",  # English
+    "precunion",    # Potentially English, though less common. Could be a neologism.
+    "ref",          # English (common abbreviation for reference)
+    "Speaker",      # English
+    "Keywords",     # English
+    "correction",   # English
+    "better",       # English
+    "许 可证号"    # Chinese (許可證號 - license number)
+    "previous",
+    "code",
+    "electro",
+    "voltage",
+    "back",
+    "subject",
+    "requirements",
+    "reach",
+    "project",
+    "telephone",
+    "ión",
+    "alisations",
+    "movies",
+    "better",
+    "recommend"
     "ocular",
     "spell",
     "License",

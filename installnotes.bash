@@ -1,17 +1,16 @@
+# On macOS and Linux.
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# On Windows.
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-conda init
-conda create --name prompt-guard python=3.12 -c conda-forge
-conda activate prompt-guard
+uv venv --python 3.12.0
 
 #cuda
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 
 #or cpu
-pip install torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-pip install -U "huggingface_hub[cli]"
-# install transformers
-pip install -U transformers
-pip install -U tiktoken
+uv pip install -U "huggingface_hub[cli]" transformers tiktoken
 
 huggingface-cli login
