@@ -72,7 +72,7 @@ uv venv --python 3.12.0
 ```
 2. Activate the environment:
 ```
-.\venv\Scripts\activate
+.\.venv\Scripts\activate
 ```
 
 ### Step 5: Install Required Packages
@@ -129,8 +129,8 @@ python hacking.py
 5. Browse to your virtual environment:
    - Find the `venv` folder created earlier
    - Select the Python interpreter inside:
-     - Windows: `venv\Scripts\python.exe`
-     - macOS/Linux: `venv/bin/python`
+     - Windows: `.venv\Scripts\python.exe`
+     - macOS/Linux: `.venv/bin/python`
 6. Click "OK" to apply
 
 ### Step 4: Run Configuration Setup
