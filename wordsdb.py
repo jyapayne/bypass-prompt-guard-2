@@ -127,6 +127,72 @@ class WordsDatabase:
             print(f"Error recording word performance: {e}")
             # Still try to continue without failing
 
+    def record_gcg_token_performance(
+        self, token: str, improvement: float, benign_score: float
+    ):
+        """Record the performance of a token from GCG attack."""
+        if self.conn is None:
+            self.initialize_db()
+
+        try:
+            cursor = self.conn.cursor()
+
+            position = "gcg"
+            token_count = 1
+            combined_score = improvement  # Use improvement as a proxy for combined_score
+
+            # Insert performance record
+            cursor.execute(
+                """
+            INSERT INTO word_performance
+            (word, position, benign_score, improvement, token_count, combined_score)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    token,
+                    position,
+                    benign_score,
+                    improvement,
+                    token_count,
+                    combined_score,
+                ),
+            )
+
+            # Update statistics
+            cursor.execute(
+                """
+            INSERT INTO word_stats
+            (word, avg_improvement, max_improvement, avg_token_count, min_token_count, use_count, best_position)
+            VALUES (?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(word) DO UPDATE SET
+                avg_improvement = (avg_improvement * use_count + ?) / (use_count + 1),
+                max_improvement = MAX(max_improvement, ?),
+                avg_token_count = (avg_token_count * use_count + ?) / (use_count + 1),
+                min_token_count = MIN(min_token_count, ?),
+                use_count = use_count + 1,
+                best_position = CASE WHEN ? > max_improvement THEN ? ELSE best_position END,
+                last_updated = CURRENT_TIMESTAMP
+            """,
+                (
+                    token,
+                    improvement,
+                    improvement,
+                    token_count,
+                    token_count,
+                    position,
+                    improvement,
+                    improvement,
+                    token_count,
+                    token_count,
+                    improvement,
+                    position,
+                ),
+            )
+
+            self.conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error recording GCG token performance: {e}")
+
     def get_top_words(
         self,
         limit: int = 20,

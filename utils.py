@@ -11,6 +11,11 @@ from wordsdb import WordsDatabase
 words_db = WordsDatabase()
 
 
+def conditional_lower(text: str, lowercase_enabled: bool) -> str:
+    """Apply lowercase conversion only if enabled."""
+    return text.lower() if lowercase_enabled else text
+
+
 def find_best_word_to_add(
     model: AutoModelForSequenceClassification,
     tokenizer: AutoTokenizer,
@@ -24,6 +29,7 @@ def find_best_word_to_add(
     use_db: bool = True,  # Whether to use the database for word selection and tracking
     token_priority: float = 0.3,  # How much to prioritize words with fewer tokens when selecting from database
     order_template: str = "{injection}{prefix}{text}",  # Template for ordering components
+    lowercase_enabled: bool = False,  # Whether to apply lowercase conversion
 ) -> Tuple[Optional[str], float]:
     """
     Evaluate multiple candidate words and find the one that most improves the benign score when added to the prefix.
@@ -42,6 +48,7 @@ def find_best_word_to_add(
     use_db: Whether to use the database for word selection and tracking
     token_priority: How much to prioritize words with fewer tokens when selecting from database
     order_template: Template string for ordering components (using {injection}, {prefix}, {text})
+    lowercase_enabled: Whether to apply lowercase conversion
 
     Returns:
     --------
@@ -52,7 +59,7 @@ def find_best_word_to_add(
 
     # Get baseline benign score with current prefix
     try:
-        full_text = order_template.format(injection=injection_text, prefix=adv_prefix, text=text)
+        full_text = conditional_lower(order_template.format(injection=injection_text, prefix=adv_prefix, text=text), lowercase_enabled)
         inputs: Dict[str, torch.Tensor] = tokenizer(full_text, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
@@ -129,7 +136,7 @@ def find_best_word_to_add(
 
     # Prepare all candidate full texts for batch evaluation
     candidate_full_texts = [
-        order_template.format(injection=injection_text, prefix=c["prefix"], text=text)
+        conditional_lower(order_template.format(injection=injection_text, prefix=c["prefix"], text=text), lowercase_enabled)
         for c in all_candidate_prefixes
     ]
 
@@ -321,6 +328,7 @@ def analyze_token_contributions(
     device: torch.device,
     min_acceptable_benign: float = 0.6,
     order_template: str = "{injection}{prefix}{text}",  # Template for ordering components
+    lowercase_enabled: bool = False,  # Whether to apply lowercase conversion
 ) -> str:
     """
     Simple, non-batched approach to remove as many tokens as possible while keeping
@@ -329,7 +337,7 @@ def analyze_token_contributions(
     print("\n----- ANALYZING TOKEN CONTRIBUTIONS (NO BATCHING) -----")
 
     # Get baseline benign score
-    full_text = order_template.format(injection=injection_text, prefix=adv_prefix, text=text)
+    full_text = conditional_lower(order_template.format(injection=injection_text, prefix=adv_prefix, text=text), lowercase_enabled)
     inputs = tokenizer(full_text, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -370,9 +378,9 @@ def analyze_token_contributions(
             candidate_prefix = tokenizer.convert_tokens_to_string(tokens_without_i)
 
             # Evaluate this candidate
-            full_text = order_template.format(
+            full_text = conditional_lower(order_template.format(
                 injection=injection_text, prefix=candidate_prefix, text=text
-            )
+            ), lowercase_enabled)
 
             try:
                 inputs = tokenizer(full_text, return_tensors="pt")
@@ -415,7 +423,7 @@ def analyze_token_contributions(
     print(f"Final token count: {len(remaining_tokens)}")
 
     # Final verification
-    full_text = order_template.format(injection=injection_text, prefix=current_prefix, text=text)
+    full_text = conditional_lower(order_template.format(injection=injection_text, prefix=current_prefix, text=text), lowercase_enabled)
     inputs = tokenizer(full_text, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -438,6 +446,7 @@ def minimize_tokens(
     benign_class_idx: int,
     device: torch.device,
     min_acceptable_benign: float = 0.6,
+    lowercase_enabled: bool = False,  # Whether to apply lowercase conversion
 ) -> str:
     """
     Minimize tokens using only token contribution analysis (ablation study).
@@ -460,6 +469,7 @@ def minimize_tokens(
         benign_class_idx,
         device=device,
         min_acceptable_benign=min_acceptable_benign,
+        lowercase_enabled=lowercase_enabled,
     )
 
     # Report final token count
@@ -576,6 +586,7 @@ def get_combined_score(
     device: torch.device,
     alpha: float = 0.5,
     token_penalty_weight: float = 0.1,
+    lowercase_enabled: bool = False,  # Whether to apply lowercase conversion
 ) -> int:
     """
     Evaluate multiple candidate prefixes using a combined score of loss minimization, benign maximization, and token count minimization.
@@ -612,7 +623,7 @@ def get_combined_score(
     max_token_count: int = max(token_counts) if token_counts else 1
 
     for idx, candidate in enumerate(candidates):
-        inputs: Dict[str, torch.Tensor] = tokenizer(candidate + text, return_tensors="pt")
+        inputs: Dict[str, torch.Tensor] = tokenizer(conditional_lower(candidate + text, lowercase_enabled), return_tensors="pt")
         # Move inputs to MPS device
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
@@ -645,10 +656,23 @@ def get_combined_score(
 
     return best_idx
 
-def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=None):
+def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=None, lowercase_enabled=False):
+    def is_english_text(text):
+        """Check if text contains only English characters, numbers, and spaces."""
+        import re
+        # Allow only English letters, numbers, and spaces,
+        english_pattern = re.compile(r'^[a-zA-Z0-9\s.,?;:()\[\]{}"\'`~@#$%^&*=_\-/<>\\|]*$')
+        return english_pattern.match(text) is not None
+    
     cands, count = [], 0
     for i in range(control_cand.shape[0]):
-        decoded_str = tokenizer.decode(control_cand[i], skip_special_tokens=True)
+        decoded_str = conditional_lower(tokenizer.decode(control_cand[i], skip_special_tokens=True), lowercase_enabled)
+        
+        # Always filter out non-English characters
+        if not is_english_text(decoded_str):
+            count += 1
+            continue
+            
         if filter_cand:
             if decoded_str != curr_control and len(tokenizer(decoded_str, add_special_tokens=False).input_ids) == len(control_cand[i]):
                 cands.append(decoded_str)
@@ -658,6 +682,12 @@ def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=N
             cands.append(decoded_str)
 
     if filter_cand:
-        cands = cands + [cands[-1]] * (len(control_cand) - len(cands))
+        # If we don't have enough candidates, pad with the last valid one or create a fallback
+        if len(cands) == 0:
+            # Fallback to current control if no valid candidates found
+            fallback = curr_control if curr_control and is_english_text(curr_control) else "test"
+            cands = [fallback] * len(control_cand)
+        else:
+            cands = cands + [cands[-1]] * (len(control_cand) - len(cands))
         # print(f"Warning: {round(count / len(control_cand), 2)} control candidates were not valid")
     return cands
